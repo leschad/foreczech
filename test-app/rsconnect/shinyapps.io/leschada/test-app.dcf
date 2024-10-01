@@ -1,0 +1,13 @@
+name: test-app
+title:
+username:
+account: leschada
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 9366690
+bundleId: 8295861
+url: https://leschada.shinyapps.io/test-app/
+when: 1708895071.21308
+lastSyncTime: 1708895071.21311
+asMultiple: FALSE
+asStatic: FALSE

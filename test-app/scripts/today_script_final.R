@@ -1,0 +1,569 @@
+library(plyr)
+library(dplyr)
+library(httr)
+library(tidyr)
+library(lubridate)
+library(mongolite)
+
+USER = "root"
+PASS = "heslo"
+HOST = "localhost:27017"
+URI = sprintf("mongodb://%s:%s@%s/", USER, PASS, HOST)
+
+read_url <- function(url_link) {
+  response <- GET(url_link)
+  json_data <- content(response, "parsed")
+  json_data
+}
+
+collect_data <- function(id, sub_to_replace, base){
+  item_url <- sub(sub_to_replace, id, base)
+  item_data <- read_url(item_url)
+  item_data
+}
+
+parse_player_data <- function(data){
+  df.result <- data %>% 
+    mutate(firstName = ifelse(is.na(firstName.default), default, firstName.default)) %>% 
+    mutate(lastName = case_when(
+      (is.na(firstName.default) & is.na(lastName.default)) ~ default.1,
+      (!is.na(firstName.default) & is.na(lastName.default))~ default,
+      TRUE ~ lastName.default)) %>% 
+    mutate(birthCity = case_when(
+      !is.na(birthCity.default) ~ birthCity.default,
+      (is.na(firstName.default) & !is.na(lastName.default)) ~ default.1,
+      (is.na(firstName.default) & is.na(lastName.default)) ~ default.2,
+      (!is.na(firstName.default) & !is.na(lastName.default)) ~ default,
+      (!is.na(firstName.default) & is.na(lastName.default)) ~ default.1)) %>% 
+    mutate(birthStateProvince = case_when(
+      (birthCountry != "CAN" & birthCountry != "USA") ~ as.character(NA),
+      !is.na(birthStateProvince.default) ~ birthStateProvince.default,
+      !is.na(default.3) ~ default.3,
+      (is.na(default.3) & !is.na(default.2)) ~ default.2,
+      (is.na(default.2) & !is.na(default.1)) ~ default.1,
+      (is.na(default.1) & !is.na(default)) ~ default)) %>%
+    mutate(positionGroup = case_when(
+      (positionCode == "C" | positionCode == "L" | positionCode == "R") ~ "F",
+      positionCode == "D" ~ "D",
+      positionCode == "G" ~ "G"
+    )) %>% 
+    unite(fullName, c("firstName", "lastName") , sep = " ", remove = TRUE) %>%
+    unite(fullNameAbbrev, c("fullName", "currentTeamAbbrev"), sep = ", ", remove = FALSE) %>% 
+    select(id, fullName, fullNameAbbrev, birthCity, birthCountry,
+           shootsCatches, sweaterNumber, positionCode, positionGroup,
+           birthDate, heightInCentimeters, weightInKilograms,
+           currentTeamAbbrev, currentTeamName)
+  
+  colnames(df.result)[colnames(df.result) == "id"] <- "playerId"
+  colnames(df.result)[colnames(df.result) == "positionCode"] <- "position"
+  
+  df.result
+}
+
+get_previous_date <- function(){
+  current_date <- Sys.Date()
+  previous_date <- current_date - 1
+  res <- format(previous_date, "%Y-%m-%d")
+  return(res)
+}
+
+get_current_seasonId <- function(){
+  standings_season_url <- "https://api-web.nhle.com/v1/standings-season"
+  df.standings_season <- read_url(standings_season_url)
+  df.seasons <- do.call(rbind, lapply(df.standings_season$seasons, function(season) season[c("id", "standingsEnd")]))
+  
+  res <- df.seasons %>%
+    as.data.frame() %>% 
+    select(id) %>% 
+    tail(1) %>% 
+    unlist() %>% 
+    unname()
+  
+  return(as.character(res))
+}
+
+season <- get_current_seasonId()
+# today <- get_previous_date()
+today <- "2024-04-10"
+
+players_collection <- paste0("players_", season)
+pbp_collection <- paste0("pbp_", today)
+toiw_collection <- paste0("toiw_", today)
+
+##############################################################################
+##############################################################################
+##############################################################################
+# players
+
+##############################################################################
+# collect teams
+
+standings_url <- "https://api-web.nhle.com/v1/standings/now"
+standings_data = read_url(standings_url)
+standings <- as.data.frame(do.call(rbind.fill, lapply(standings_data$standings, function(it) as.data.frame(it))))
+teams <- standings %>% 
+  mutate(teamAbbrev = ifelse(!is.na(default.2), default.2, default.1)) %>% 
+  select(teamAbbrev, teamName.default)
+
+##############################################################################
+# collect players
+
+rosters_url <- "https://api-web.nhle.com/v1/roster/{team}/{season}"
+rosters_20232024_url <- sub("\\{season\\}", season, rosters_url)
+
+df.players <- do.call(rbind.fill, lapply(teams$teamAbbrev, function(abbrev) {
+  teamData <- collect_data(abbrev, "\\{team\\}", rosters_20232024_url)
+  roster <- c(teamData$forwards, teamData$defensemen, teamData$goalies)
+  roster <- do.call(rbind.fill, lapply(roster, function(it) as.data.frame(it)))
+  roster$currentTeamAbbrev <- abbrev
+  return(roster)
+}))
+
+df.players <- df.players %>% 
+  left_join(teams, by = c("currentTeamAbbrev" = "teamAbbrev"))
+colnames(df.players)[colnames(df.players) == "teamName.default"] <- "currentTeamName"
+
+df.players <- parse_player_data(df.players)
+
+df.czech_players <- df.players %>% 
+  filter(birthCountry == "CZE")
+
+##############################################################################
+# collect short trend
+
+calcSec <- function(time){
+  split <- strsplit(time, ":")
+  minToSec <- as.numeric(split[[1]][1]) * 60
+  sec <- as.numeric(split[[1]][2])
+  return(minToSec + sec)
+}
+
+# skaters
+df.skaters <- df.czech_players %>% 
+  filter(position != "G")
+
+log_url <- "https://api-web.nhle.com/v1/player/{player_id}/game-log/{season}/2"
+log_20232024_url <- sub("\\{season\\}", season, log_url)
+
+df.skaters <- do.call(rbind.fill, lapply(df.skaters$playerId, function(id){
+  log <- do.call(rbind.fill, lapply(collect_data(id, "\\{player_id\\}", log_20232024_url)$gameLog, function(it) as.data.frame(it)))
+  if(is.null(log))
+    return(data.frame(
+      playerId = id
+    ))
+  num_cols <- c("goals", "assists", "points", "shots", "shifts")
+  log <- log %>%
+    select(teamAbbrev, opponentAbbrev, homeRoadFlag, gameDate, toi, goals, assists, points, shots, shifts) %>%
+    mutate(toi = as.character(toi))
+  log[num_cols] <- lapply(log[num_cols], as.numeric)
+  log$toi <- sapply(log$toi, function(it) calcSec(it))
+  
+  test <- df.skaters %>% 
+    filter(playerId == id)
+  test$log_teamAbbrev <- list(rev(log$teamAbbrev))
+  test$log_opponentAbbrev <- list(rev(log$opponentAbbrev))
+  test$log_homeRoad <- list(rev(log$homeRoadFlag))
+  test$log_gameDate <- list(rev(log$gameDate))
+  test$log_toi <- list(rev(log$toi))
+  test$log_goals <- list(rev(log$goals))
+  test$log_assists <- list(rev(log$assists))
+  test$log_points <- list(rev(log$points))
+  test$log_shots <- list(rev(log$shots))
+  test$log_shifts <- list(rev(log$shifts))
+  test$log_n <- list(1:length(test$log_goals[[1]]))
+  
+  tmp <- unlist(test$log_toi) / 60
+  test$log_toiMin <- list(tmp)
+  
+  test$log_shiftsPer <- list(round(unlist(test$log_toi) / unlist(test$log_shifts), digits = 0))
+  
+  test$log_goalsSum <- lapply(test$log_goals, cumsum)
+  test$log_assistsSum <- lapply(test$log_assists, cumsum)
+  test$log_pointsSum <- lapply(test$log_points, cumsum)
+  test$log_shotsSum <- lapply(test$log_shots, cumsum)
+  return(test)
+}))
+
+df.skaters <- df.skaters %>% 
+  filter(!is.na(fullName))
+
+# goalies
+df.goalies <- df.czech_players %>% 
+  filter(position == "G")
+
+df.goalies <- do.call(rbind.fill, lapply(df.goalies$playerId, function(id){
+  log <- do.call(rbind.fill, lapply(collect_data(id, "\\{player_id\\}", log_20232024_url)$gameLog, function(it) as.data.frame(it)))
+  if(is.null(log))
+    return(data.frame(
+      playerId = id
+    ))
+  num_cols <- c("gamesStarted", "shotsAgainst", "goalsAgainst", "shutouts")
+  log <- log %>%
+    select(teamAbbrev, opponentAbbrev, homeRoadFlag, gameDate, toi, gamesStarted,
+           shotsAgainst, goalsAgainst, shutouts, savePctg, decision) %>%
+    mutate(toi = as.character(toi))
+  log[num_cols] <- lapply(log[num_cols], as.numeric)
+  log$toi <- sapply(log$toi, function(it) calcSec(it))
+  
+  test <- df.goalies %>% 
+    filter(playerId == id)
+  test$log_teamAbbrev <- list(rev(log$teamAbbrev))
+  test$log_opponentAbbrev <- list(rev(log$opponentAbbrev))
+  test$log_homeRoad <- list(rev(log$homeRoadFlag))
+  test$log_gameDate <- list(rev(log$gameDate))
+  test$log_toi <- list(rev(log$toi))
+  test$log_shotsAgainst <- list(rev(log$shotsAgainst))
+  test$log_goalsAgainst <- list(rev(log$goalsAgainst))
+  test$log_shutouts <- list(rev(log$shutouts))
+  test$log_savePctg <- list(rev(round(ifelse(is.na(log$savePctg), 1, log$savePctg) * 100, digits = 0)))
+  test$log_decision <- list(rev(log$decision))
+  test$log_n <- list(1:length(test$log_goalsAgainst[[1]]))
+  
+  tmp <- unlist(test$log_toi) / 60
+  test$log_toiMin <- list(tmp)
+  
+  gamesStartedLabels <- sapply(rev(log$gamesStarted), function(it)
+    ifelse(it == 1, return("Start"), return("Střídání")))
+  test$log_gamesStarted <- list(gamesStartedLabels)
+  
+  test$log_shotsAgainstSum <- lapply(test$log_shotsAgainst, cumsum)
+  test$log_goalsAgainstSum <- lapply(test$log_goalsAgainst, cumsum)
+  
+  return(test)
+}))
+
+df.goalies <- df.goalies %>% 
+  filter(!is.na(fullName))
+
+df.czech_players <- rbind.fill(df.skaters, df.goalies)
+
+conPlayers <- mongo(collection = players_collection, url = URI)
+conPlayers$drop()
+conPlayers$insert(df.czech_players)
+
+##############################################################################
+##############################################################################
+##############################################################################
+# pbp
+
+convert_time <- function(time, hockey_period) {
+  time <- paste(today, time)
+  per <- parse_date_time(time, "y-m-d M:S")
+  minute(per) <- minute(per) + case_when(hockey_period == 1 ~ 0,
+                                         hockey_period == 2 ~ 20,
+                                         hockey_period == 3 ~ 40)
+  if(minute(per)[1] >= 60){
+    minute(per) <- minute(per) %% 60
+    hour(per) <- hour(per) + 1
+  }
+  res <- sprintf("%02d-%02d-%02d %02d:%02d:%02d", year(per), month(per), day(per), hour(per), minute(per), second(per))
+  res
+}
+
+##############################################################################
+# read schedule
+
+schedule_base <- "https://api-web.nhle.com/v1/schedule/{current_date}"
+schedule_url <- sub("\\{current_date\\}", today, schedule_base)
+
+schedule_data <- read_url(schedule_url)
+game_week <- schedule_data$gameWeek
+
+game_week_index <- function(game_week, today) {
+  indexes <- which(sapply(game_week, function(item) item$date == today))
+  return(indexes)
+}
+
+day_index <- game_week_index(game_week, today)
+games_today <- game_week[[day_index]]$games
+id_games <- lapply(games_today, function(item) cbind(item$id, item$homeTeam$abbrev))
+
+if(length(id_games) == 0){
+  # conPbp <- mongo(collection = pbp_collection, url = URI)
+  # conPbp$drop()
+  # 
+  # conToiw <- mongo(collection = toiw_collection, url = URI)
+  # conToiw$drop()
+  
+  opt <- options(show.error.messages = FALSE)
+  on.exit(options(opt))
+  stop()
+}
+##############################################################################
+# read pbp data
+
+pbp_base <- "https://api-web.nhle.com/v1/gamecenter/{game_id}/play-by-play"
+pbp_data <- do.call(rbind, lapply(id_games, function(id) {
+  res <- collect_data(id[1], "\\{game_id\\}", pbp_base)
+  res <- cbind(res$id, res$plays, id[2])
+  res
+}))
+
+colnames(pbp_data) <- c("gameId", "pbp", "homeTeamAbbrev")
+df.pbp <- as.data.frame(pbp_data)
+df.pbp <- df.pbp %>%
+  unnest_wider(pbp, names_repair = "universal") %>% 
+  filter(details != "NULL" & typeDescKey != "stoppage" & typeDescKey != "delayed-penalty") %>%
+  unnest_wider(periodDescriptor, names_repair = "universal") %>% 
+  unnest_wider(details, names_repair = "universal")
+
+df.pbp <- df.pbp %>% 
+  pivot_longer(
+    c(playerId, losingPlayerId, winningPlayerId, hittingPlayerId, hitteePlayerId,
+      committedByPlayerId, drawnByPlayerId, shootingPlayerId, goalieInNetId,
+      blockingPlayerId, scoringPlayerId, assist1PlayerId, assist2PlayerId),
+    names_to = "playerType",
+    values_to = "playerId",
+    values_drop_na = TRUE) %>%
+  mutate(timeStamp = convert_time(timeInPeriod, number)) %>% 
+  select(playerId, playerType, timeStamp, gameId, typeDescKey, xCoord, yCoord,
+         shotType, descKey, duration, homeTeamDefendingSide, homeTeamAbbrev) %>% 
+  filter((typeDescKey != "missed-shot" | playerType != "goalieInNetId")
+         & playerType != "assist1PlayerId" & playerType != "assist2PlayerId")
+
+shootingPlayerType <- "shootingPlayerId"
+scoringPlayerType <- "scoringPlayerId"
+goaliePlayerType <- "goalieInNetId"
+
+df.pbp <- df.pbp %>% 
+  mutate(shotResult = case_when(
+    (typeDescKey == "blocked-shot" & playerType == shootingPlayerType) ~ "blocked",
+    (typeDescKey == "missed-shot" & playerType == shootingPlayerType) ~ "missed",
+    (typeDescKey == "shot-on-goal" & 
+       (playerType == shootingPlayerType | playerType == goaliePlayerType)) ~ "on target",
+    (typeDescKey == "goal" & 
+       (playerType == scoringPlayerType | playerType == goaliePlayerType)) ~ "goal",
+    TRUE ~ "regular")) %>% 
+  mutate(typeDescKey = case_when(
+    (typeDescKey == "blocked-shot" & playerType == shootingPlayerType) ~ "shot",
+    (typeDescKey == "missed-shot") ~ "shot",
+    (typeDescKey == "shot-on-goal" & 
+       (playerType == shootingPlayerType | playerType == goaliePlayerType)) ~ "shot",
+    (typeDescKey == "goal") ~ "shot",
+    (typeDescKey == "penalty" & playerType == "committedByPlayerId") ~ "committedPenalty",
+    (typeDescKey == "penalty" & playerType == "drawnByPlayerId") ~ "drawnPenalty",
+    TRUE ~ as.character(typeDescKey))) %>% 
+  mutate(playerType = sub("Id", "", playerType)) %>% 
+  mutate(playerType = ifelse((typeDescKey == "committedPenalty" | typeDescKey == "drawnPenalty"), "player", playerType))
+
+colnames(df.pbp)[colnames(df.pbp) %in% c("typeDescKey", "descKey", "duration")] <- c("event", "penalty.desc", "penalty.duration")
+
+cols.int <- c("gameId")
+cols.char <- c("homeTeamAbbrev")
+df.pbp[cols.int] <- sapply(df.pbp[cols.int], as.integer)
+df.pbp[cols.char] <- sapply(df.pbp[cols.char], as.character)
+
+##############################################################################
+# only czech players
+
+# conPlayers <- mongo(collection = "players", url = URI)
+df.czech_players <- conPlayers$find()
+
+df.pbp_czechs <- df.pbp %>% 
+  inner_join(df.czech_players, by = c("playerId" = "playerId"))
+
+df.pbp_czechs <- df.pbp_czechs %>% 
+  select(playerId, playerType, timeStamp, gameId, event, xCoord, yCoord,
+         shotType, penalty.desc, penalty.duration,
+         homeTeamDefendingSide, currentTeamAbbrev, homeTeamAbbrev,
+         shotResult, fullName, birthCountry)
+
+df.pbp_czechs <- df.pbp_czechs %>% 
+  mutate(eventLabel = case_when(
+    event == "faceoff" ~ "vhazování",
+    event == "hit" ~ "hit",
+    event == "shot" ~ "střela",
+    event == "giveaway" ~ "ztráta puku",
+    event == "blocked-shot" ~ "zblokovaná střela",
+    event == "takeaway" ~ "zisk puku",
+    event == "committedPenalty" ~ "faul",
+    event == "drawnPenalty" ~ "faul proti",
+    TRUE ~ event
+  )) %>%
+  mutate(eventShape = case_when(
+    event == "faceoff" ~ "16",
+    event == "hit" ~ "10",
+    event == "shot" ~ "16",
+    event == "committedPenalty" ~ "18",
+    event == "drawnPenalty" ~ "19",
+    event == "giveaway" ~ "12",
+    event == "blocked-shot" ~ "13",
+    event == "takeaway" ~ "9",
+    TRUE ~ event
+  )) %>% 
+  mutate(shotResultLabel = case_when(
+    shotResult == "regular" ~ "regular",
+    shotResult == "on target" ~ "na bránu",
+    shotResult == "goal" ~ "gól",
+    shotResult == "blocked" ~ "zblokovaná",
+    shotResult == "missed" ~ "mimo bránu",
+    TRUE ~ shotResult
+  )) %>% 
+  mutate(shotColor = case_when(
+    shotResult == "regular" ~ "#000000",
+    shotResult == "on target" ~ "#009E73",
+    shotResult == "goal" ~ "#0072B2",
+    shotResult == "blocked" ~ "#CC79A7",
+    shotResult == "missed" ~ "#D55E00",
+    TRUE ~ "#000000"
+  )) %>% 
+  mutate(yCoord = ifelse((event != "shot"
+                          & ((homeTeamAbbrev == currentTeamAbbrev & homeTeamDefendingSide == "right")
+                             | (homeTeamAbbrev != currentTeamAbbrev & homeTeamDefendingSide == "left")))
+                         |  (event == "shot" & xCoord < 0),
+                         -yCoord,  yCoord)) %>% 
+  mutate(xCoord = case_when(event != "shot"
+                            & ((homeTeamAbbrev == currentTeamAbbrev & homeTeamDefendingSide == "right")
+                               | (homeTeamAbbrev != currentTeamAbbrev & homeTeamDefendingSide == "left")) ~ -xCoord,
+                            event == "shot" ~ abs(xCoord),
+                            TRUE ~ xCoord))
+
+conPbp <- mongo(collection = pbp_collection, url = URI)
+conPbp$drop()
+conPbp$insert(df.pbp_czechs)
+
+##############################################################################
+##############################################################################
+##############################################################################
+# toiw
+
+is_valid_date <- function(input_string) {
+  pattern <- "^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}$"
+  
+  if (grepl(pattern, input_string)) {
+    return(TRUE)
+  } else {
+    return(FALSE)
+  }
+}
+
+##############################################################################
+# save shift data
+
+shift_base <- "https://api.nhle.com/stats/rest/en/shiftcharts?cayenneExp=gameId={game_id}"
+shift_data <- do.call("c", lapply(id_games, function(id){
+  single_game <- collect_data(id[1], "\\{game_id\\}", shift_base)
+  single_game$data
+}))
+
+df.shifts <- as.data.frame(do.call(rbind, shift_data))
+
+df.shifts <- df.shifts %>% 
+  mutate(fullName = paste(firstName, lastName)) %>% 
+  mutate(startTime = ifelse(is.na(startTime), startTime, convert_time(startTime, period))) %>% 
+  mutate(endTime = ifelse(is.na(endTime), endTime, convert_time(endTime, period)))
+
+calc_toiw <- function(model_player, df.model_player_shifts, df.names, df.all_shifts){
+  df.toiw <- data.frame(playerId = numeric(),
+                        playerName = character(),
+                        playerTeam = character(),
+                        otherPlayerId = numeric(),
+                        otherPlayerName = character(),
+                        otherPlayerTeam = character(),
+                        hexValue = character(),
+                        time = numeric())
+  
+  for(k in 1:length(df.names$playerId)){
+    player_id <- df.names$playerId[k]
+    player_name <- df.names$fullName[k]
+    other_player_team <- df.names$teamAbbrev[k]
+    hex <- df.names$hexValue[k]
+    
+    df.shifts_player <- df.all_shifts %>% 
+      filter(as.numeric(playerId) == as.numeric(player_id) & !is.na(duration))
+    
+    times <- list()
+    for(i in 1:nrow(df.shifts_player)){
+      shift <- df.shifts_player[i,]
+      tmp <- 0
+      if(is_valid_date(shift$startTime) && is_valid_date(shift$endTime)){
+        for(j in 1:nrow(df.model_player_shifts)){
+          row <- df.model_player_shifts[j,]
+          if(is_valid_date(row$startTime) && is_valid_date(row$endTime)){
+            if(shift$startTime <= row$startTime && shift$endTime >= row$endTime)
+              tmp <- tmp + as.numeric(difftime(row$endTime, row$startTime, units = "secs"))
+            else if(row$startTime <= shift$startTime && row$endTime >= shift$endTime)
+              tmp <- tmp + as.numeric(difftime(shift$endTime, shift$startTime, units = "secs"))
+            else if(shift$startTime <= row$startTime && shift$endTime >= row$startTime && shift$endTime <= row$endTime)
+              tmp <- tmp + as.numeric(difftime(shift$endTime, row$startTime, units = "secs"))
+            else if(row$startTime <= shift$startTime && row$endTime >= shift$startTime && row$endTime <= shift$endTime)
+              tmp <- tmp + as.numeric(difftime(row$endTime, shift$startTime, units = "secs"))
+          }
+      }
+      times <- append(times, tmp)
+      }
+    }
+    
+    df.toiw[nrow(df.toiw)+1,] <- c(model_player$playerId, model_player$fullName,
+                                   model_player$currentTeamAbbrev,
+                                   player_id, player_name, other_player_team,
+                                   hex, sum(unlist(times)))
+  }
+  return(df.toiw)
+}
+
+czechs_toiw <- function(df.players, df.all_shifts){
+  df.nationality_toiw <- data.frame(playerId = numeric(),
+                                    playerName = character(),
+                                    otherPlayerId = numeric(),
+                                    otherPlayerName = character(),
+                                    time = numeric())
+  for(i in 1:nrow(df.players)){
+    elem <- df.players[i,]
+    player_id <- elem$playerId
+    player_name <- elem$fullName
+    player_team <- elem$currentTeamAbbrev
+    game_id <- elem$gameId
+    
+    df.shifts_tmp <- df.all_shifts %>% 
+      filter(playerId == player_id) %>% 
+      filter(duration != "NULL")
+    
+    df.others_tmp <- df.all_shifts %>%
+      filter(gameId == game_id & duration != "NULL") %>%
+      filter(playerId != player_id) %>% 
+      select(playerId, fullName, teamAbbrev, hexValue) %>% 
+      unique()
+    
+    df.nationality_toiw <- rbind(df.nationality_toiw,
+                                 calc_toiw(elem, df.shifts_tmp, df.others_tmp, df.all_shifts))
+  }
+  return(df.nationality_toiw)
+}
+
+# conPbp <- mongo(collection = "pbp", url = URI)
+df.pbp <- conPbp$find()
+
+df.czechs_in_action <- df.pbp %>%
+  select(playerId, fullName, currentTeamAbbrev, gameId) %>% 
+  unique()
+
+df.toiw <- czechs_toiw(df.czechs_in_action, df.shifts)
+
+other_players <- df.toiw %>% 
+  select(otherPlayerId) %>% 
+  unique()
+
+player_info_base <- "https://api-web.nhle.com/v1/player/{player_id}/landing"
+other_players_data <- lapply(other_players[[1]], function(id) collect_data(id, "\\{player_id\\}", player_info_base))
+
+df.other_positions <- do.call(rbind.fill, lapply(other_players_data, function(it) as.data.frame(it)))
+df.other_positions <- df.other_positions %>% 
+  select(playerId, position) %>% 
+  mutate(positionGroup = case_when(
+    (position == "C" | position == "L" | position == "R") ~ "F",
+    position == "D" ~ "D",
+    position == "G" ~ "G"))
+
+df.toiw <- df.toiw %>%
+  left_join(df.other_positions, by = c("otherPlayerId" = "playerId"))
+
+colnames(df.toiw)[colnames(df.toiw) %in% c("position", "positionGroup")] <- c("otherPlayerPosition", "otherPlayerPositionGroup")
+
+df.toiw <- df.toiw %>% 
+  filter(otherPlayerPosition != "G") %>% 
+  mutate(timeInMin = time/60)
+
+conToiw <- mongo(collection = toiw_collection, url = URI)
+conToiw$drop()
+conToiw$insert(df.toiw)
